@@ -38,7 +38,9 @@ static double tf_get_time_ms(void) {
 
 /* Use BLAS for matrix operations when enabled via Makefile */
 #ifdef USE_BLAS
-#ifdef __APPLE__
+#ifdef USE_CUBLAS
+#include "flux_cublas.h"
+#elif defined(__APPLE__)
 #include <Accelerate/Accelerate.h>
 #else
 #include <cblas.h>
@@ -1059,19 +1061,29 @@ static void mha_forward(float *out, const float *q, const float *k, const float 
             float *sh = scores + h * seq * seq;
 
             /* scores = Q @ K^T using BLAS */
+#ifdef USE_CUBLAS
+            flux_cublas_sgemm(0, 1, seq, seq, head_dim,
+                              scale, qh, head_dim, kh, head_dim, 0.0f, sh, seq);
+#else
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                         seq, seq, head_dim,
                         scale, qh, head_dim, kh, head_dim,
                         0.0f, sh, seq);
+#endif
 
             /* Softmax */
             flux_softmax(sh, seq, seq);
 
             /* out = scores @ V using BLAS */
+#ifdef USE_CUBLAS
+            flux_cublas_sgemm(0, 0, seq, head_dim, seq,
+                              1.0f, sh, seq, vh, head_dim, 0.0f, oh, head_dim);
+#else
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                         seq, head_dim, seq,
                         1.0f, sh, seq, vh, head_dim,
                         0.0f, oh, head_dim);
+#endif
         }
 
         /* Transpose output back to [seq, heads, head_dim] */
@@ -1178,26 +1190,46 @@ static void joint_attention(float *img_out, float *txt_out,
             float *txt_sh = scores + img_seq * total_seq;
 
             /* Image attention: img_Q @ cat_K^T */
+#ifdef USE_CUBLAS
+            flux_cublas_sgemm(0, 1, img_seq, total_seq, head_dim,
+                              scale, img_qh, head_dim, kh, head_dim, 0.0f, img_sh, total_seq);
+#else
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                         img_seq, total_seq, head_dim,
                         scale, img_qh, head_dim, kh, head_dim,
                         0.0f, img_sh, total_seq);
+#endif
             flux_softmax(img_sh, img_seq, total_seq);
+#ifdef USE_CUBLAS
+            flux_cublas_sgemm(0, 0, img_seq, head_dim, total_seq,
+                              1.0f, img_sh, total_seq, vh, head_dim, 0.0f, img_oh, head_dim);
+#else
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                         img_seq, head_dim, total_seq,
                         1.0f, img_sh, total_seq, vh, head_dim,
                         0.0f, img_oh, head_dim);
+#endif
 
             /* Text attention: txt_Q @ cat_K^T */
+#ifdef USE_CUBLAS
+            flux_cublas_sgemm(0, 1, txt_seq, total_seq, head_dim,
+                              scale, txt_qh, head_dim, kh, head_dim, 0.0f, txt_sh, total_seq);
+#else
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                         txt_seq, total_seq, head_dim,
                         scale, txt_qh, head_dim, kh, head_dim,
                         0.0f, txt_sh, total_seq);
+#endif
             flux_softmax(txt_sh, txt_seq, total_seq);
+#ifdef USE_CUBLAS
+            flux_cublas_sgemm(0, 0, txt_seq, head_dim, total_seq,
+                              1.0f, txt_sh, total_seq, vh, head_dim, 0.0f, txt_oh, head_dim);
+#else
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                         txt_seq, head_dim, total_seq,
                         1.0f, txt_sh, total_seq, vh, head_dim,
                         0.0f, txt_oh, head_dim);
+#endif
         }
 
         /* Transpose outputs back */

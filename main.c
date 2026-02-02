@@ -35,6 +35,10 @@
 #include "flux_metal.h"
 #endif
 
+#ifdef USE_CUBLAS
+#include "flux_cublas.h"
+#endif
+
 /* ========================================================================
  * Verbosity Levels
  * ======================================================================== */
@@ -240,6 +244,10 @@ static void print_usage(const char *prog) {
 int main(int argc, char *argv[]) {
 #ifdef USE_METAL
     flux_metal_init();
+#elif defined(USE_CUBLAS)
+    if (!flux_cublas_init()) {
+        fprintf(stderr, "Warning: cuBLAS init failed, falling back to CPU\n");
+    }
 #elif defined(USE_BLAS)
     fprintf(stderr, "BLAS: CPU acceleration enabled (Accelerate/OpenBLAS)\n");
 #else
@@ -619,6 +627,10 @@ int main(int argc, char *argv[]) {
 
 #ifdef USE_METAL
     flux_metal_cleanup();
+#endif
+
+#ifdef USE_CUBLAS
+    flux_cublas_cleanup();
 #endif
 
     return 0;

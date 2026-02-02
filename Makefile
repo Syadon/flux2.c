@@ -21,7 +21,7 @@ LIB = libflux.a
 # Debug build flags
 DEBUG_CFLAGS = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address
 
-.PHONY: all clean debug lib install info test pngtest help generic blas mps
+.PHONY: all clean debug lib install info test pngtest help generic blas cublas mps
 
 # Default: show available targets
 all: help
@@ -32,6 +32,9 @@ help:
 	@echo "Choose a backend:"
 	@echo "  make generic  - Pure C, no dependencies (slow)"
 	@echo "  make blas     - With BLAS acceleration (~30x faster)"
+ifneq ($(UNAME_S),Darwin)
+	@echo "  make cublas   - NVIDIA GPU with cuBLAS (fastest on Linux)"
+endif
 ifeq ($(UNAME_S),Darwin)
 ifeq ($(UNAME_M),arm64)
 	@echo "  make mps      - Apple Silicon with Metal GPU (fastest)"
@@ -69,6 +72,27 @@ endif
 blas: clean $(TARGET)
 	@echo ""
 	@echo "Built with BLAS backend (~30x faster than generic)"
+
+# =============================================================================
+# Backend: cublas (NVIDIA GPU with cuBLAS)
+# =============================================================================
+NVCC := nvcc
+CUDA_PATH ?= /usr/local/cuda
+CUBLAS_CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_CUBLAS -I$(CUDA_PATH)/include
+CUBLAS_LDFLAGS = $(LDFLAGS) -L$(CUDA_PATH)/lib64 -lcudart -lcublas
+
+cublas: clean cublas-build
+	@echo ""
+	@echo "Built with cuBLAS backend (NVIDIA GPU acceleration)"
+
+cublas-build: $(SRCS:.c=.cublas.o) $(CLI_SRCS:.c=.cublas.o) flux_cublas.o main.cublas.o
+	$(CC) $(CUBLAS_CFLAGS) -o $(TARGET) $^ $(CUBLAS_LDFLAGS)
+
+%.cublas.o: %.c flux.h flux_kernels.h
+	$(CC) $(CUBLAS_CFLAGS) -c -o $@ $<
+
+flux_cublas.o: flux_cublas.cu flux_cublas.h
+	$(NVCC) -O3 -c -o $@ $<
 
 # =============================================================================
 # Backend: mps (Apple Silicon Metal GPU)
@@ -153,7 +177,7 @@ install: $(TARGET) $(LIB)
 	install -m 644 flux_kernels.h /usr/local/include/
 
 clean:
-	rm -f $(OBJS) $(CLI_OBJS) *.mps.o flux_metal.o main.o $(TARGET) $(LIB)
+	rm -f $(OBJS) $(CLI_OBJS) *.mps.o *.cublas.o flux_metal.o flux_cublas.o main.o $(TARGET) $(LIB)
 	rm -f flux_shaders_source.h
 
 info:
@@ -169,6 +193,7 @@ ifeq ($(UNAME_M),arm64)
 endif
 else
 	@echo "  blas    - OpenBLAS (requires libopenblas-dev)"
+	@echo "  cublas  - NVIDIA cuBLAS (requires CUDA toolkit)"
 endif
 
 # =============================================================================

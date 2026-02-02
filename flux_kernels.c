@@ -16,9 +16,16 @@
 #include "flux_metal.h"
 #endif
 
+/* Use cuBLAS for GPU acceleration on NVIDIA GPUs */
+#ifdef USE_CUBLAS
+#include "flux_cublas.h"
+#endif
+
 /* Use BLAS for matrix operations when enabled via Makefile */
 #ifdef USE_BLAS
-#ifdef __APPLE__
+#ifdef USE_CUBLAS
+/* cuBLAS provides BLAS via GPU - no need for CPU BLAS */
+#elif defined(__APPLE__)
 #include <Accelerate/Accelerate.h>
 #else
 #include <cblas.h>
@@ -149,10 +156,14 @@ void flux_matmul(float *C, const float *A, const float *B,
 #endif
 
 #ifdef USE_BLAS
+#ifdef USE_CUBLAS
+    flux_cublas_sgemm(0, 0, M, N, K, 1.0f, A, K, B, N, 0.0f, C, N);
+#else
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                 M, N, K,
                 1.0f, A, K, B, N,
                 0.0f, C, N);
+#endif
 #else
     /* Fallback: naive implementation */
     for (int m = 0; m < M; m++) {
@@ -186,10 +197,14 @@ void flux_matmul_t(float *C, const float *A, const float *B,
 #endif
 
 #ifdef USE_BLAS
+#ifdef USE_CUBLAS
+    flux_cublas_sgemm(0, 1, M, N, K, 1.0f, A, K, B, K, 0.0f, C, N);
+#else
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                 M, N, K,
                 1.0f, A, K, B, K,
                 0.0f, C, N);
+#endif
 #else
     /* Fallback: naive implementation */
     for (int m = 0; m < M; m++) {
@@ -243,10 +258,15 @@ void flux_linear(float *y, const float *x, const float *W, const float *b,
      * B[N, K] = W[out_dim, in_dim]
      * C[M, N] = y[seq_len, out_dim]
      */
+#ifdef USE_CUBLAS
+    flux_cublas_sgemm(0, 1, seq_len, out_dim, in_dim,
+                      1.0f, x, in_dim, W, in_dim, 0.0f, y, out_dim);
+#else
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                 seq_len, out_dim, in_dim,
                 1.0f, x, in_dim, W, in_dim,
                 0.0f, y, out_dim);
+#endif
 
     /* Add bias if present */
     if (b != NULL) {
@@ -407,11 +427,16 @@ void flux_conv2d(float *out, const float *in, const float *weight, const float *
             }
 
             /* sgemm: tmp[out_ch, tile_pixels] = weight[out_ch, K] @ col[K, tile_pixels] */
+#ifdef USE_CUBLAS
+            flux_cublas_sgemm(0, 0, out_ch, tile_pixels, K,
+                              1.0f, weight, K, col, tile_pixels, 0.0f, tmp, tile_pixels);
+#else
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                         out_ch, tile_pixels, K,
                         1.0f, weight, K,
                         col, tile_pixels,
                         0.0f, tmp, tile_pixels);
+#endif
 
             /* Scatter tile output to correct positions in out_b */
             for (int oc = 0; oc < out_ch; oc++) {
@@ -791,10 +816,16 @@ static void flash_attention_head_tiled(float *out,
 
             /* Compute tile scores: Q_tile @ K_tile^T * scale */
 #ifdef USE_BLAS
+#ifdef USE_CUBLAS
+            flux_cublas_sgemm(0, 1, q_len, k_len, head_dim,
+                              scale, Q_tile, head_dim, K_tile, head_dim,
+                              0.0f, tile_scores, k_tile_size);
+#else
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                         q_len, k_len, head_dim,
                         scale, Q_tile, head_dim, K_tile, head_dim,
                         0.0f, tile_scores, k_tile_size);
+#endif
 #else
             for (int qi = 0; qi < q_len; qi++) {
                 for (int ki = 0; ki < k_len; ki++) {

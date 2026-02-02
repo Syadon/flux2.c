@@ -18,7 +18,9 @@
 
 /* Use BLAS for matrix operations when enabled via Makefile */
 #ifdef USE_BLAS
-#ifdef __APPLE__
+#ifdef USE_CUBLAS
+#include "flux_cublas.h"
+#elif defined(__APPLE__)
 #include <Accelerate/Accelerate.h>
 #else
 #include <cblas.h>
@@ -154,10 +156,15 @@ static void qwen3_linear(float *y, const float *x, const float *W,
 #endif
 
 #ifdef USE_BLAS
+#ifdef USE_CUBLAS
+    flux_cublas_sgemm(0, 1, seq_len, out_dim, in_dim,
+                      1.0f, x, in_dim, W, in_dim, 0.0f, y, out_dim);
+#else
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                 seq_len, out_dim, in_dim,
                 1.0f, x, in_dim, W, in_dim,
                 0.0f, y, out_dim);
+#endif
 #else
     for (int s = 0; s < seq_len; s++) {
         for (int o = 0; o < out_dim; o++) {
@@ -379,10 +386,23 @@ static void qwen3_attention_forward(qwen3_model_t *model, qwen3_layer_t *layer,
             /* scores = scale * Q @ K^T using strided BLAS
              * Q: [seq_len, head_dim] with lda=q_dim, K^T: [head_dim, seq_len] */
 #ifdef USE_BLAS
+#ifdef USE_CUBLAS
+            /* cuBLAS cannot handle strided data - copy Q to contiguous buffer */
+            float *q_head = model->attn_q_head;
+            for (int s = 0; s < seq_len; s++) {
+                for (int d = 0; d < head_dim; d++) {
+                    q_head[s * head_dim + d] = q_strided[s * q_dim + d];
+                }
+            }
+            flux_cublas_sgemm(0, 0, seq_len, seq_len, head_dim,
+                              scale, q_head, head_dim, k_head_t, seq_len,
+                              0.0f, scores, seq_len);
+#else
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                         seq_len, seq_len, head_dim,
                         scale, q_strided, q_dim, k_head_t, seq_len,
                         0.0f, scores, seq_len);
+#endif
 #else
             /* Fallback: naive matmul with strided Q access */
             for (int i = 0; i < seq_len; i++) {
@@ -420,10 +440,30 @@ static void qwen3_attention_forward(qwen3_model_t *model, qwen3_layer_t *layer,
             /* out = scores @ V using strided BLAS (avoids V copy and output copy)
              * scores: [seq_len, seq_len], V: [seq_len, head_dim] with ldb=kv_dim */
 #ifdef USE_BLAS
+#ifdef USE_CUBLAS
+            /* cuBLAS cannot handle strided data - copy V to contiguous buffer */
+            float *v_head = model->attn_v_head;
+            for (int s = 0; s < seq_len; s++) {
+                for (int d = 0; d < head_dim; d++) {
+                    v_head[s * head_dim + d] = v_strided[s * kv_dim + d];
+                }
+            }
+            float *out_head = model->attn_out_head;
+            flux_cublas_sgemm(0, 0, seq_len, head_dim, seq_len,
+                              1.0f, scores, seq_len, v_head, head_dim,
+                              0.0f, out_head, head_dim);
+            /* Copy result back to strided output */
+            for (int s = 0; s < seq_len; s++) {
+                for (int d = 0; d < head_dim; d++) {
+                    out_strided[s * q_dim + d] = out_head[s * head_dim + d];
+                }
+            }
+#else
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                         seq_len, head_dim, seq_len,
                         1.0f, scores, seq_len, v_strided, kv_dim,
                         0.0f, out_strided, q_dim);
+#endif
 #else
             for (int i = 0; i < seq_len; i++) {
                 for (int d = 0; d < head_dim; d++) {

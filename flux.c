@@ -620,6 +620,7 @@ flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
     }
 
     /* Encode image to latent */
+    if (flux_phase_callback) flux_phase_callback("encoding reference image", 0);
     float *img_tensor = flux_image_to_tensor(img_to_use);
     if (resized) flux_image_free(resized);
 
@@ -637,6 +638,7 @@ flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
     }
 
     free(img_tensor);
+    if (flux_phase_callback) flux_phase_callback("encoding reference image", 1);
 
     if (!img_latent) {
         free(text_emb);

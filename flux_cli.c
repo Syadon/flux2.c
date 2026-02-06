@@ -17,6 +17,7 @@
 #include <errno.h>
 
 #include "flux.h"
+#include "flux_kernels.h"
 #include "flux_qwen3.h"  /* For QWEN3_MAX_SEQ_LEN, QWEN3_TEXT_DIM */
 #include "embcache.h"
 #include "linenoise.h"
@@ -55,7 +56,11 @@ typedef struct {
     int width;
     int height;
     int steps;
+    float guidance;
     int64_t seed;
+    int linear_schedule;
+    int power_schedule;
+    float power_alpha;
     int image_count;
     int show_enabled;
     int open_enabled;
@@ -239,6 +244,71 @@ static void display_image(const char *path) {
 }
 
 /* ======================================================================
+ * Progress display
+ * ====================================================================== */
+
+enum { PROG_NONE, PROG_TEXT, PROG_VAE, PROG_STEP };
+static int cli_progress_phase = PROG_NONE;
+
+static void cli_text_progress(int layer, int total) {
+    (void)total;
+    (void)layer;
+    if (cli_progress_phase != PROG_TEXT) {
+        if (cli_progress_phase != PROG_NONE) fprintf(stderr, "\n");
+        cli_progress_phase = PROG_TEXT;
+    }
+    fprintf(stderr, "t");
+    fflush(stderr);
+}
+
+static void cli_vae_progress(int block, int total) {
+    (void)total;
+    (void)block;
+    if (cli_progress_phase != PROG_VAE) {
+        if (cli_progress_phase != PROG_NONE) fprintf(stderr, "\n");
+        cli_progress_phase = PROG_VAE;
+    }
+    fprintf(stderr, "v");
+    fflush(stderr);
+}
+
+static void cli_step_progress(int step, int total) {
+    if (cli_progress_phase != PROG_NONE) fprintf(stderr, "\n");
+    cli_progress_phase = PROG_STEP;
+    fprintf(stderr, "[%d/%d]:", step, total);
+    fflush(stderr);
+}
+
+static void cli_substep_progress(flux_substep_type_t type, int index, int total) {
+    (void)index;
+    (void)total;
+    if (type == FLUX_SUBSTEP_DOUBLE_BLOCK)
+        fprintf(stderr, "d");
+    else if (type == FLUX_SUBSTEP_SINGLE_BLOCK)
+        fprintf(stderr, "s");
+    else if (type == FLUX_SUBSTEP_FINAL_LAYER)
+        fprintf(stderr, "f");
+    fflush(stderr);
+}
+
+static void cli_progress_start(void) {
+    cli_progress_phase = PROG_NONE;
+    flux_text_progress_callback = cli_text_progress;
+    flux_vae_progress_callback = cli_vae_progress;
+    flux_step_callback = cli_step_progress;
+    flux_substep_callback = cli_substep_progress;
+}
+
+static void cli_progress_end(void) {
+    fprintf(stderr, "\n");
+    cli_progress_phase = PROG_NONE;
+    flux_text_progress_callback = NULL;
+    flux_vae_progress_callback = NULL;
+    flux_step_callback = NULL;
+    flux_substep_callback = NULL;
+}
+
+/* ======================================================================
  * Generation
  * ====================================================================== */
 
@@ -246,6 +316,10 @@ static int generate_image(const char *prompt, const char *ref_image,
                           int explicit_width, int explicit_height) {
     flux_params params = FLUX_PARAMS_DEFAULT;
     params.num_steps = state.steps;
+    params.guidance = state.guidance;
+    params.linear_schedule = state.linear_schedule;
+    params.power_schedule = state.power_schedule;
+    params.power_alpha = state.power_alpha;
 
     /* Determine seed */
     int64_t actual_seed;
@@ -260,6 +334,9 @@ static int generate_image(const char *prompt, const char *ref_image,
     /* Start timing */
     struct timespec start_time, end_time;
     clock_gettime(CLOCK_MONOTONIC, &start_time);
+
+    /* Set up progress callbacks */
+    cli_progress_start();
 
     /* Generate */
     flux_image *img;
@@ -291,33 +368,37 @@ static int generate_image(const char *prompt, const char *ref_image,
         }
         printf("Generating %dx%d...\n", params.width, params.height);
 
-        /* Try to use cached embedding */
-        float *embeddings = emb_cache_lookup(prompt);
-        if (embeddings) {
-            printf("(using cached embedding)\n");
-            img = flux_generate_with_embeddings(state.ctx, embeddings,
-                                                 QWEN3_MAX_SEQ_LEN, &params);
-            free(embeddings);
+        if (!flux_is_distilled(state.ctx)) {
+            /* Base model: use flux_generate() which handles CFG internally
+             * (needs both conditioned and unconditioned text encoding) */
+            img = flux_generate(state.ctx, prompt, &params);
         } else {
-            /* Encode and cache for next time */
-            int seq_len;
-            embeddings = flux_encode_text(state.ctx, prompt, &seq_len);
+            /* Distilled model: use embedding cache for faster repeat prompts */
+            float *embeddings = emb_cache_lookup(prompt);
             if (embeddings) {
-                /* Cache the embedding (4-bit quantized) */
-                emb_cache_store(prompt, embeddings,
-                                seq_len * QWEN3_TEXT_DIM);
-
-                /* Release text encoder to free memory before generation */
-                flux_release_text_encoder(state.ctx);
-
+                printf("(using cached embedding)\n");
                 img = flux_generate_with_embeddings(state.ctx, embeddings,
-                                                     seq_len, &params);
+                                                     QWEN3_MAX_SEQ_LEN, &params);
                 free(embeddings);
             } else {
-                img = NULL;
+                /* Encode and cache for next time */
+                int seq_len;
+                embeddings = flux_encode_text(state.ctx, prompt, &seq_len);
+                if (embeddings) {
+                    emb_cache_store(prompt, embeddings,
+                                    seq_len * QWEN3_TEXT_DIM);
+                    flux_release_text_encoder(state.ctx);
+                    img = flux_generate_with_embeddings(state.ctx, embeddings,
+                                                         seq_len, &params);
+                    free(embeddings);
+                } else {
+                    img = NULL;
+                }
             }
         }
     }
+
+    cli_progress_end();
 
     /* End timing */
     clock_gettime(CLOCK_MONOTONIC, &end_time);
@@ -349,6 +430,10 @@ static int generate_multiref(const char *prompt, const char **ref_paths, int num
                              int explicit_width, int explicit_height) {
     flux_params params = FLUX_PARAMS_DEFAULT;
     params.num_steps = state.steps;
+    params.guidance = state.guidance;
+    params.linear_schedule = state.linear_schedule;
+    params.power_schedule = state.power_schedule;
+    params.power_alpha = state.power_alpha;
 
     /* Determine seed */
     int64_t actual_seed;
@@ -388,6 +473,8 @@ static int generate_multiref(const char *prompt, const char **ref_paths, int num
     printf("Generating %dx%d (multi-ref, %d images)...\n",
            params.width, params.height, num_refs);
 
+    cli_progress_start();
+
     flux_image *img = flux_multiref(state.ctx, prompt,
                                      (const flux_image **)refs, num_refs, &params);
 
@@ -396,6 +483,8 @@ static int generate_multiref(const char *prompt, const char **ref_paths, int num
         flux_image_free(refs[i]);
     }
     free(refs);
+
+    cli_progress_end();
 
     /* End timing */
     clock_gettime(CLOCK_MONOTONIC, &end_time);
@@ -435,7 +524,10 @@ static void cmd_help(void) {
     printf("  !load <filename>      Load image for img2img\n");
     printf("  !seed <n>             Set seed (-1 for random)\n");
     printf("  !size <W>x<H>         Set default size\n");
-    printf("  !steps <n>            Set sampling steps\n");
+    printf("  !steps <n>            Set sampling steps (0 = auto)\n");
+    printf("  !guidance <n>         Set CFG guidance scale (0 = auto)\n");
+    printf("  !linear               Toggle linear timestep schedule\n");
+    printf("  !power [alpha]        Toggle power schedule (default alpha: 2.0)\n");
     printf("  !explore <n> <prompt> Generate n thumbnail variations\n");
     printf("  !show                 Toggle terminal display\n");
     printf("  !zoom <n>             Set display zoom (default: 2 for Retina)\n");
@@ -573,12 +665,39 @@ static void cmd_steps(char *arg) {
     }
 
     int val = atoi(arg);
+    if (val == 0) {
+        /* Reset to model default */
+        state.steps = flux_is_distilled(state.ctx) ? 4 : 50;
+        printf("Steps: %d (auto)\n", state.steps);
+        return;
+    }
     if (val < 1 || val > 256) {
-        fprintf(stderr, "Error: Steps must be 1-256.\n");
+        fprintf(stderr, "Error: Steps must be 0-256 (0 = auto).\n");
         return;
     }
     state.steps = val;
     printf("Steps: %d\n", state.steps);
+}
+
+static void cmd_guidance(char *arg) {
+    arg = skip_spaces(arg);
+
+    if (!*arg) {
+        printf("Guidance: %.1f\n", state.guidance);
+        return;
+    }
+
+    float val = atof(arg);
+    if (val < 0 || val > 100) {
+        fprintf(stderr, "Error: Guidance must be 0-100 (0 = auto).\n");
+        return;
+    }
+    state.guidance = val;
+    if (state.guidance == 0) {
+        printf("Guidance: auto\n");
+    } else {
+        printf("Guidance: %.1f\n", state.guidance);
+    }
 }
 
 static void cmd_explore(char *arg) {
@@ -625,49 +744,72 @@ static void cmd_explore(char *arg) {
     printf("Generating %d images at %dx%d...\n",
            count, state.width, state.height);
 
-    /* Try cached embedding first */
-    int seq_len = QWEN3_MAX_SEQ_LEN;
-    float *embeddings = emb_cache_lookup(prompt);
-
-    if (embeddings) {
-        printf("(using cached embedding)\n");
-    } else {
-        /* Encode and cache */
-        embeddings = flux_encode_text(state.ctx, prompt, &seq_len);
-        if (!embeddings) {
-            fprintf(stderr, "Error: Failed to encode prompt.\n");
-            free(prompt_to_free);
-            return;
-        }
-        /* Cache for future use */
-        emb_cache_store(prompt, embeddings, seq_len * QWEN3_TEXT_DIM);
-        flux_release_text_encoder(state.ctx);
-    }
-
     flux_params params = FLUX_PARAMS_DEFAULT;
     params.width = state.width;
     params.height = state.height;
     params.num_steps = state.steps;
+    params.guidance = state.guidance;
+    params.linear_schedule = state.linear_schedule;
+    params.power_schedule = state.power_schedule;
+    params.power_alpha = state.power_alpha;
 
-    for (int i = 0; i < count; i++) {
-        int64_t seed = (int64_t)time(NULL) ^ (int64_t)rand() ^ (int64_t)i;
-        params.seed = seed;
+    if (!flux_is_distilled(state.ctx)) {
+        /* Base model: use flux_generate() for CFG support */
+        for (int i = 0; i < count; i++) {
+            int64_t seed = (int64_t)time(NULL) ^ (int64_t)rand() ^ (int64_t)i;
+            params.seed = seed;
 
-        printf("  [%d/%d] Seed: %lld ", i + 1, count, (long long)seed);
-        fflush(stdout);
+            printf("  [%d/%d] Seed: %lld ", i + 1, count, (long long)seed);
+            fflush(stdout);
 
-        flux_image *img = flux_generate_with_embeddings(state.ctx, embeddings,
-                                                         seq_len, &params);
-        if (img) {
-            terminal_display_image(img, cli_term_proto);
-            flux_image_free(img);
-            printf("\n");
-        } else {
-            printf("(failed)\n");
+            flux_image *img = flux_generate(state.ctx, prompt, &params);
+            if (img) {
+                terminal_display_image(img, cli_term_proto);
+                flux_image_free(img);
+                printf("\n");
+            } else {
+                printf("(failed)\n");
+            }
         }
+    } else {
+        /* Distilled model: use embedding cache for faster repeat prompts */
+        int seq_len = QWEN3_MAX_SEQ_LEN;
+        float *embeddings = emb_cache_lookup(prompt);
+
+        if (embeddings) {
+            printf("(using cached embedding)\n");
+        } else {
+            embeddings = flux_encode_text(state.ctx, prompt, &seq_len);
+            if (!embeddings) {
+                fprintf(stderr, "Error: Failed to encode prompt.\n");
+                free(prompt_to_free);
+                return;
+            }
+            emb_cache_store(prompt, embeddings, seq_len * QWEN3_TEXT_DIM);
+            flux_release_text_encoder(state.ctx);
+        }
+
+        for (int i = 0; i < count; i++) {
+            int64_t seed = (int64_t)time(NULL) ^ (int64_t)rand() ^ (int64_t)i;
+            params.seed = seed;
+
+            printf("  [%d/%d] Seed: %lld ", i + 1, count, (long long)seed);
+            fflush(stdout);
+
+            flux_image *img = flux_generate_with_embeddings(state.ctx, embeddings,
+                                                             seq_len, &params);
+            if (img) {
+                terminal_display_image(img, cli_term_proto);
+                flux_image_free(img);
+                printf("\n");
+            } else {
+                printf("(failed)\n");
+            }
+        }
+
+        free(embeddings);
     }
 
-    free(embeddings);
     free(prompt_to_free);
     printf("Done. Use !seed <n> then re-run prompt at full size.\n");
 }
@@ -718,6 +860,24 @@ static int process_command(char *line) {
         cmd_size(cmd + 4);
     } else if (starts_with_ci(cmd, "steps")) {
         cmd_steps(cmd + 5);
+    } else if (starts_with_ci(cmd, "guidance")) {
+        cmd_guidance(cmd + 8);
+    } else if (starts_with_ci(cmd, "linear")) {
+        state.linear_schedule = !state.linear_schedule;
+        if (state.linear_schedule) state.power_schedule = 0;
+        printf("Schedule: %s\n", state.linear_schedule ? "linear" : "shifted sigmoid");
+    } else if (starts_with_ci(cmd, "power")) {
+        char *arg = skip_spaces(cmd + 5);
+        if (*arg) {
+            float val = atof(arg);
+            if (val > 0) state.power_alpha = val;
+        }
+        state.power_schedule = !state.power_schedule;
+        if (state.power_schedule) state.linear_schedule = 0;
+        printf("Schedule: %s\n", state.power_schedule ?
+               "power" : "shifted sigmoid");
+        if (state.power_schedule)
+            printf("Power alpha: %.1f\n", state.power_alpha);
     } else if (starts_with_ci(cmd, "explore")) {
         cmd_explore(cmd + 7);
     } else if (starts_with_ci(cmd, "show")) {
@@ -830,6 +990,7 @@ static void print_banner(void) {
         printf("Display: Images saved to %s/\n", state.tmpdir);
     }
 
+    printf("Type: %s\n", flux_is_distilled(state.ctx) ? "distilled" : "base (CFG)");
     printf("\nType a prompt to generate an image. Use !help for commands.\n");
     printf("Default size: %dx%d | Steps: %d | Seed: %s\n\n",
            state.width, state.height, state.steps,
@@ -843,8 +1004,11 @@ int flux_cli_run(flux_ctx *ctx, const char *model_dir) {
     strncpy(state.model_dir, model_dir, sizeof(state.model_dir) - 1);
     state.width = CLI_DEFAULT_WIDTH;
     state.height = CLI_DEFAULT_HEIGHT;
-    state.steps = CLI_DEFAULT_STEPS;
+    /* Use model defaults for steps and guidance */
+    state.steps = flux_is_distilled(ctx) ? 4 : 50;
+    state.guidance = 0.0f;  /* 0 = auto from model type */
     state.seed = -1;
+    state.power_alpha = 2.0f;
 
     /* Initialize embedding cache */
     emb_cache_init();
@@ -867,6 +1031,7 @@ int flux_cli_run(flux_ctx *ctx, const char *model_dir) {
         linenoiseHistoryLoad(history_path);
     }
     linenoiseHistorySetMaxLen(500);
+    linenoiseSetMultiLine(1);
 
     print_banner();
 

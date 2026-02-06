@@ -1,5 +1,11 @@
-This is a C implementation of the Flux.2 Klein model, a distilled image synthesis model
-created by Black Forest Labs, with 4 billion parameters, working in 4 steps.
+This is a C implementation of the Flux.2 Klein model, an image synthesis model
+created by Black Forest Labs, with 4 billion parameters.
+
+Two model variants are supported:
+- **Distilled** (flux-klein-model): 4 steps, no CFG, fast.
+- **Base** (flux-klein-base-model): 50 steps default, Classifier-Free Guidance (CFG), higher quality but ~25x slower.
+
+Both share the same architecture and weight format. The model type is autodetected from `model_index.json` in the model directory (distilled has `"is_distilled": true`, base lacks this field). The `--base` CLI flag can force base mode.
 
 - The model works both in txt2img mode than in img2img mode with text conditioning.
 - The text embedding is created via Qwen3 4B.
@@ -35,12 +41,17 @@ main.c                  - CLI entry point
 ```
 1. Text Encoding:    prompt → Qwen3 → [512, 7680] embeddings
 2. Latent Init:      random noise [H/16, W/16, 128]
-3. Denoising Loop (4 steps):
+3. Denoising Loop (4 steps distilled, 50 steps base):
    └─ per step: 5 double blocks → 20 single blocks → final layer → velocity
 4. VAE Decode:       latents → VAE decoder → RGB image
 
 img2img: Reference images are VAE-encoded and passed as extra tokens (not noise).
 The model attends to them via joint attention (in-context conditioning).
+
+Base model CFG: each denoising step runs the transformer twice (once with empty
+prompt, once with real prompt). Combined as: v = v_uncond + guidance * (v_cond - v_uncond).
+The empty prompt is literal "" through the Qwen3 chat template. The two passes
+are run sequentially (not batched).
 ```
 
 # Key Architecture Constants
@@ -69,7 +80,7 @@ This project implements three different targets:
 # Development rules
 
 - We don't add any dependency to this project. Even the PNG and JPG support is implemented internally. The only acceptable dependencies are the blas / openblas library and the Metal primitives that are part of MacOS.
-- Don't accept speed improvements that are just marginal, like 1%: they may be just random fluctations among runs. Refuse small speed improvements especially if they make the code much slower.
+- Don't accept speed improvements that are just marginal, like 1%: they may be just random fluctations among runs. Refuse small speed improvements especially if they make the code more complicated, however more complex code for important speed improvements is ok.
 - Always test a code modification after implementing it, using `make test`
 - Once you reach a positive result, commit it.
 - Never add or commit unstaged files, unless you created them for a specific purpose.
@@ -81,8 +92,9 @@ This project implements three different targets:
 # How to run the project
 
     ./flux2 -d flux-klein-model -p "a cat and a dog playing" -o /tmp/test.png
+    ./flux2 -d flux-klein-base-model -p "a cat and a dog playing" -o /tmp/test.png
 
-You have yur weights ready in `flux-klein-model`. If you can't find them, there is a download script, but before using it ask the user.
+You have your weights ready in `flux-klein-model` (distilled) and `flux-klein-base-model` (base). If you can't find them, there is a download script (`--base` for the base model), but before using it ask the user.
 
 # Where to find the reference implementation in Python
 
@@ -203,3 +215,4 @@ print('PASS' if diff.max() < 2 else 'FAIL')
 
 1. **Unified RoPE kernel indexing**: GPU must use consecutive pairs (d, d+1), not axis-based (i0, i0+half_axis)
 2. **GPU caching of timestep params**: shift/scale/gate change each step, don't use weight cache for them
+3. **CLI mode CFG routing**: In interactive CLI mode, the base model must go through `flux_generate()` (which handles CFG internally), not `flux_generate_with_embeddings()` which only supports single-embedding distilled path

@@ -225,22 +225,30 @@ static int jpeg_read_byte(jpeg_bitstream *bs) {
     if (bs->pos >= bs->len) return -1;
     uint8_t b = bs->data[bs->pos++];
     if (b == 0xFF) {
+        /* Skip any fill bytes (extra 0xFF) */
+        while (bs->pos < bs->len && bs->data[bs->pos] == 0xFF) {
+            bs->pos++;
+        }
         if (bs->pos >= bs->len) return -1;
+
         uint8_t next = bs->data[bs->pos];
         if (next == 0x00) {
-            bs->pos++;  /* Skip stuffed zero */
-        } else if (next >= JPEG_RST0 && next <= JPEG_RST0 + 7) {
-            bs->pos++;  /* Skip restart marker */
-            return jpeg_read_byte(bs);  /* Get next actual byte */
-        } else if (next == 0xFF) {
-            /* Fill byte - skip it and get next actual byte */
-            bs->pos++;  /* Skip the fill 0xFF */
-            return jpeg_read_byte(bs);  /* Get next actual byte */
-        } else {
-            /* Non-RST marker found - end of scan data */
-            bs->pos--;  /* Back up to point to the 0xFF */
-            return -1;  /* Signal end of scan */
+            /* Stuffed 0x00 means literal 0xFF data byte */
+            bs->pos++;
+            return 0xFF;
         }
+
+        /* Marker found (including restart markers).
+         *
+         * IMPORTANT: Don't consume the marker here. If we skip restart markers
+         * inside the bitreader, the 8-bit Huffman fast path (peek_bits(8))
+         * can read past a restart boundary and accidentally consume bytes from
+         * the next interval. Instead, signal the marker and let the scan-level
+         * logic consume restart markers at the correct MCU boundary.
+         */
+        bs->pos--;  /* Back up so bs->data[bs->pos] points at 0xFF */
+        if (next >= JPEG_RST0 && next <= JPEG_RST0 + 7) return -2; /* Restart marker */
+        return -1;  /* Other marker (end of scan data) */
     }
     return b;
 }
@@ -249,7 +257,10 @@ static int jpeg_read_byte(jpeg_bitstream *bs) {
 static int jpeg_get_bits(jpeg_bitstream *bs, int n) {
     while (bs->bitcount < n) {
         int b = jpeg_read_byte(bs);
-        if (b < 0) {
+        if (b == -2) {
+            /* Restart marker encountered: treat as fill bits without setting EOF. */
+            b = 0xFF;
+        } else if (b < 0) {
             /* At EOF - pad with 1s (JPEG convention for fill bits) */
             b = 0xFF;
             bs->eof = 1;
@@ -265,7 +276,10 @@ static int jpeg_get_bits(jpeg_bitstream *bs, int n) {
 static int jpeg_peek_bits(jpeg_bitstream *bs, int n) {
     while (bs->bitcount < n) {
         int b = jpeg_read_byte(bs);
-        if (b < 0) {
+        if (b == -2) {
+            /* Restart marker encountered: treat as fill bits without setting EOF. */
+            b = 0xFF;
+        } else if (b < 0) {
             /* At EOF - pad with 1s (JPEG convention for fill bits) */
             b = 0xFF;
             bs->eof = 1;
@@ -611,6 +625,27 @@ static void jpeg_ycbcr_to_rgb(uint8_t y, uint8_t cb, uint8_t cr, uint8_t *rgb) {
     rgb[2] = JPEG_CLAMP(b);
 }
 
+/* Consume a restart marker at the current bitstream position.
+ * Caller must ensure the bitstream is byte-aligned (bitcount == 0). */
+static int jpeg_skip_restart_marker(jpeg_decoder *dec) {
+    jpeg_bitstream *bs = &dec->bs;
+
+    /* Skip any fill bytes (extra 0xFF) */
+    while (bs->pos + 1 < bs->len &&
+           bs->data[bs->pos] == 0xFF &&
+           bs->data[bs->pos + 1] == 0xFF) {
+        bs->pos++;
+    }
+
+    if (bs->pos + 1 >= bs->len) return -1;
+    if (bs->data[bs->pos] != 0xFF) return -1;
+    uint8_t marker = bs->data[bs->pos + 1];
+    if (marker < JPEG_RST0 || marker > JPEG_RST0 + 7) return -1;
+
+    bs->pos += 2;
+    return 0;
+}
+
 /* Decode scan data for baseline JPEG */
 static int jpeg_decode_scan(jpeg_decoder *dec, uint8_t *y_data, uint8_t *cb_data, uint8_t *cr_data) {
     int block[64];
@@ -635,6 +670,7 @@ static int jpeg_decode_scan(jpeg_decoder *dec, uint8_t *y_data, uint8_t *cb_data
                 for (int i = 0; i < 4; i++) {
                     dec->dc_pred[i] = 0;
                 }
+                if (jpeg_skip_restart_marker(dec) < 0) return -1;
                 restart_count = dec->restart_interval;
             }
 
@@ -950,6 +986,8 @@ static int jpeg_decode_progressive_scan(jpeg_decoder *dec, int *scan_comps, int 
                     for (int i = 0; i < 4; i++) {
                         dec->dc_pred[i] = 0;
                     }
+                    dec->eobrun = 0;
+                    if (jpeg_skip_restart_marker(dec) < 0) return -1;
                     restart_count = dec->restart_interval;
                 }
 
@@ -1013,6 +1051,10 @@ static int jpeg_decode_progressive_scan(jpeg_decoder *dec, int *scan_comps, int 
                     dec->bs.bitcount = 0;
                     dec->bs.bitbuf = 0;
                     dec->eobrun = 0;
+                    for (int i = 0; i < 4; i++) {
+                        dec->dc_pred[i] = 0;
+                    }
+                    if (jpeg_skip_restart_marker(dec) < 0) return -1;
                     restart_count = dec->restart_interval;
                 }
 

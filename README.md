@@ -2,6 +2,11 @@
 
 This program generates images from text prompts (and optionally from other images) using the [FLUX.2-klein-4B model](https://bfl.ai/models/flux-2-klein) from [Black Forest Labs](https://bfl.ai/). It can be used as a library as well, and is implemented entirely in C, with zero external dependencies beyond the C standard library. MPS and BLAS or cuBLAS acceleration are optional but recommended.
 
+Supported models:
+
+- Flux.2 4B Klein distilled model (4 steps, auto guidance set to 1, very fast).
+- Flux.2 4B Klein base model. (50 steps for max quality, or less. Classifier-Free Diffusion Guidance, much slower but more generation variety).
+
 ## Quick Start
 
 ```bash
@@ -17,6 +22,13 @@ make mps       # Apple Silicon (fastest)
 
 # Generate an image
 ./flux -d flux-klein-model -p "A woman wearing sunglasses" -o output.png
+```
+
+If you want to try the base model, instead of the distilled one (much slower, higher quality), use the following instructions. Use 10 steps if your computer is quite slow, instead of the default of 50, it will still work well enough to test it (10 seconds to generate a 256x256 image on a MacBook M3 Max).
+```
+./download_model.sh --base
+# or: pip install huggingface_hub && python download_model.py --base
+./flux -d flux-klein-base-model -p "A woman wearing sunglasses" -o output.png
 ```
 
 That's it. No Python runtime or CUDA toolkit required at inference time.
@@ -147,7 +159,7 @@ Done -> /tmp/flux-.../image-0003.png (ref $2)
 - `$N prompt` - img2img with reference $N
 - `$0 $3 prompt` - multi-reference (combine images)
 
-**Commands:** `!help`, `!save`, `!load`, `!seed`, `!size`, `!steps`, `!explore`, `!show`, `!quit`
+**Commands:** `!help`, `!save`, `!load`, `!seed`, `!size`, `!steps`, `!guidance`, `!linear`, `!power`, `!explore`, `!show`, `!quit`
 
 ### Command Line Options
 
@@ -162,8 +174,13 @@ Done -> /tmp/flux-.../image-0003.png (ref $2)
 ```
 -W, --width N         Output width in pixels (default: 256)
 -H, --height N        Output height in pixels (default: 256)
--s, --steps N         Sampling steps (default: 4)
+-s, --steps N         Sampling steps (default: auto, 4 distilled / 50 base)
 -S, --seed N          Random seed for reproducibility
+-g, --guidance N      CFG guidance scale (default: auto, 1.0 distilled / 4.0 base)
+    --linear          Use linear timestep schedule (see below)
+    --power           Use power curve timestep schedule (see below)
+    --power-alpha N   Set power schedule exponent (default: 2.0)
+    --base            Force base model mode (undistilled, CFG enabled)
 ```
 
 **Image-to-image options:**
@@ -282,20 +299,21 @@ python3 run_test.py --flux-binary ./flux --model-dir /path/to/model
 
 ## Model Download
 
-Download the model weights (~16GB) from HuggingFace using one of these methods:
+Download model weights from HuggingFace using one of these methods:
 
-**Option 1: Shell script (requires curl)**
+**Distilled model** (~16GB, fast 4-step inference):
 ```bash
-./download_model.sh
+./download_model.sh                      # using curl
+# or: python download_model.py           # using huggingface_hub
 ```
 
-**Option 2: Python script (requires huggingface_hub)**
+**Base model** (~16GB, 50-step inference with CFG, higher quality):
 ```bash
-pip install huggingface_hub
-python download_model.py
+./download_model.sh --base
+# or: python download_model.py --base
 ```
 
-Both download the same files to `./flux-klein-model`:
+The distilled model downloads to `./flux-klein-model`, the base model to `./flux-klein-base-model`. Both contain:
 - VAE (~300MB)
 - Transformer (~4GB)
 - Qwen3-4B Text Encoder (~8GB)
@@ -303,7 +321,7 @@ Both download the same files to `./flux-klein-model`:
 
 ## How Fast Is It?
 
-Benchmarks on **Apple M3 Max** (128GB RAM), generating a 4-step image.
+Benchmarks on **Apple M3 Max** (128GB RAM), distilled model (4 steps).
 
 The MPS implementation matches the PyTorch optimized pipeline performance, providing better speed for small image sizes.
 
@@ -315,6 +333,7 @@ The MPS implementation matches the PyTorch optimized pipeline performance, provi
 
 **Notes:**
 - All times measured as wall clock, including model loading, no warmup. PyTorch times exclude library import overhead (~5-10s) to be fair.
+- The base model is roughly 25x slower (50 steps × 2 passes per step vs 4 steps × 1 pass). It actually produces acceptable results even with 10 steps, so you can tune quality/time. The 25x figure is not exactly accurate because it only covers the denoising steps: text encoding and VAE use the same time for both the models, however such steps are a minor percentage of the generation time.
 - The C BLAS backend (CPU) is not shown.
 - The `make generic` backend (pure C, no BLAS) is approximately 30x slower than BLAS and not included in benchmarks.
 - The fastest implementation for Metal remains [the Draw Things app](https://drawthings.ai/) that can produce a 1024x1024 image in just 14 seconds!
@@ -329,7 +348,7 @@ Dimensions should be multiples of 16 (the VAE downsampling factor).
 
 ## Model Architecture
 
-**FLUX.2-klein-4B** is a rectified flow transformer optimized for fast inference:
+Both models share the same architecture, a rectified flow transformer:
 
 | Component | Architecture |
 |-----------|-------------|
@@ -337,7 +356,46 @@ Dimensions should be multiples of 16 (the VAE downsampling factor).
 | VAE | AutoencoderKL, 128 latent channels, 8x spatial compression |
 | Text Encoder | Qwen3-4B, 36 layers, 2560 hidden dim |
 
-**Inference steps**: This is a distilled model that produces good results with exactly 4 sampling steps.
+The models differ in inference:
+
+| | Distilled | Base |
+|---|-----------|------|
+| Steps | 4 | 50 (default) |
+| CFG guidance | 1.0 (none) | 4.0 (default) |
+| Passes per step | 1 | 2 (conditioned + unconditioned) |
+
+The model type is autodetected from `model_index.json` in the model directory. Use `--base` to force base model mode if autodetection fails.
+
+**Classifier-Free Guidance (CFG)**: The base model runs the transformer twice per step — once with an empty prompt (unconditioned) and once with the real prompt (conditioned). The final velocity is `v = v_uncond + guidance * (v_cond - v_uncond)`. This makes each step ~2x slower than the distilled model, and the base model needs ~12x more steps, making it roughly 25x slower overall.
+
+## Timestep Schedule
+
+By default, denoising uses a **shifted sigmoid** timestep schedule (matching the official BFL implementation). This schedule concentrates most steps in the high-noise regime and rushes through the detail-forming region near t=0. For the 4 steps distilled model, this is definitely the way to go, and changing scheduler will produce proor results.
+
+### Linear scheduling
+
+However, for the base model, the shifted sigmoid shceduler may look extremely unbalanced — for example at 10 steps, the first 5 steps cover only 12% of the denoising trajectory while the last 5 steps cover 88%. Still, the base model works well with this scheduler, but after some testing I decided to add the `--linear` flag in order to switch to a uniform timestep schedule, where each step covers an equal portion of the trajectory. This sometimes produces better results with the **base model**, at least more realistic looking results, especially at reduced step count (10 steps, for instance, which is 1/5 of execution time compared to the default 50 steps), since the linear schedule avoids the huge final steps that the shifted sigmoid creates, and this alters the generation in a significant way, often in interesting ways.
+
+### Power curve scheduler
+
+The `--power` flag provides a middle ground: a power curve schedule (`t = 1 - (i/n)^α`) that is denser at the start and sparser at the end, but less extreme than the shifted sigmoid. The default exponent is 2.0 (quadratic); use `--power-alpha` to adjust it (1.0 = linear, higher = more front-loaded).
+
+```bash
+# Base model with 10 steps and linear schedule
+./flux -d flux-klein-base-model -p "a cat" -o cat.png -s 10 --linear
+
+# Base model with power schedule (quadratic by default)
+./flux -d flux-klein-base-model -p "a cat" -o cat.png -s 10 --power
+
+# Power schedule with custom exponent
+./flux -d flux-klein-base-model -p "a cat" -o cat.png -s 10 --power-alpha 1.5
+```
+
+In interactive CLI mode, toggle with `!linear` or `!power [alpha]`.
+
+**Note**: for the distilled model (4 steps), the shifted sigmoid schedule is part of the distillation training, so alternative schedules are not recommended.
+
+If you have a terminal supporting the iTerm2 or Kitty terminal graphics protocols, it is strongly suggested to test the different schedulers with --show and --show-steps options. It is quite an experience to see the denoising process happening in different ways.
 
 ## Memory Requirements
 
@@ -476,6 +534,7 @@ int main(void) {
     flux_free(ctx);
     return 0;
 }
+```
 
 ### Generating Multiple Images
 
@@ -543,6 +602,8 @@ void flux_image_free(flux_image *img);
 void flux_set_seed(int64_t seed);                  /* Set RNG seed for reproducibility */
 const char *flux_get_error(void);                  /* Get last error message */
 void flux_release_text_encoder(flux_ctx *ctx);     /* Manually free ~8GB (optional) */
+int flux_is_distilled(flux_ctx *ctx);              /* 1 = distilled, 0 = base */
+void flux_set_base_mode(flux_ctx *ctx);            /* Force base model mode */
 ```
 
 ### Parameters
@@ -551,12 +612,16 @@ void flux_release_text_encoder(flux_ctx *ctx);     /* Manually free ~8GB (option
 typedef struct {
     int width;              /* Output width in pixels (default: 256) */
     int height;             /* Output height in pixels (default: 256) */
-    int num_steps;          /* Denoising steps, use 4 for klein (default: 4) */
+    int num_steps;          /* Denoising steps, 0 = auto (4 distilled, 50 base) */
     int64_t seed;           /* Random seed, -1 for random (default: -1) */
+    float guidance;         /* CFG guidance scale, 0 = auto (1.0 distilled, 4.0 base) */
+    int linear_schedule;    /* Use linear timestep schedule (0 = shifted sigmoid) */
+    int power_schedule;     /* Use power curve timestep schedule */
+    float power_alpha;      /* Exponent for power schedule (default: 2.0) */
 } flux_params;
 
-/* Initialize with sensible defaults */
-#define FLUX_PARAMS_DEFAULT { 256, 256, 4, -1 }
+/* Initialize with sensible defaults (auto steps and guidance from model type) */
+#define FLUX_PARAMS_DEFAULT { 256, 256, 0, -1, 0.0f, 0, 0, 2.0f }
 ```
 
 ## Debugging
